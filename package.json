@@ -1,0 +1,13 @@
+{
+  "name": "dinner-roulette-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^9.0.0",
+    "express": "^4.19.2"
+  }
+}
