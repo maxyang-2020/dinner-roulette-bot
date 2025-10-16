@@ -1,5 +1,5 @@
-// index.js — LINE 晚餐輪盤（Google Sheets 永久保存版）
-// 需求：express, @line/bot-sdk, googleapis
+// index.js — LINE 晚餐輪盤（Google Sheets 永久保存 + Flex 卡片 + /id /debug）
+// 需要套件：express, @line/bot-sdk, googleapis
 
 const express = require("express");
 const { Client, validateSignature } = require("@line/bot-sdk");
@@ -14,16 +14,23 @@ const config = {
 const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
 const SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Sheet1";
 
-// ====== Google Sheets Auth ======
+// ====== Google Sheets Auth（含防呆的 private key 正規化）======
 const sheets = google.sheets("v4");
+const rawKey = process.env.GOOGLE_PRIVATE_KEY || "";
+const normalizedKey = rawKey
+  .trim()
+  .replace(/^"(.*)"$/s, "$1") // 移除最外層雙引號（若誤貼）
+  .replace(/\\r\\n/g, "\n")
+  .replace(/\\n/g, "\n");
+
 const auth = new google.auth.JWT(
   process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
   null,
-  (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+  normalizedKey,
   ["https://www.googleapis.com/auth/spreadsheets"]
 );
 
-// 啟動授權（重要，能提早發現 key/權限問題）
+// 啟動授權（可提早偵測 key / 權限問題）
 (async () => {
   try {
     await auth.authorize();
@@ -40,11 +47,9 @@ function getChatKey(source) {
   if (source.type === "room") return `room:${source.roomId}`;
   return "unknown";
 }
-
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
-
 function quickReply() {
   return {
     items: [
@@ -52,6 +57,44 @@ function quickReply() {
       { type: "action", action: { type: "message", label: "看清單", text: "清單" } },
       { type: "action", action: { type: "message", label: "教我用", text: "說明" } },
     ],
+  };
+}
+
+// ====== Flex：晚餐結果卡片 ======
+function buildDinnerCard(name) {
+  return {
+    type: "bubble",
+    body: {
+      type: "box",
+      layout: "vertical",
+      spacing: "md",
+      paddingAll: "20px",
+      contents: [
+        {
+          type: "text",
+          text: "今晚吃這個 👇",
+          weight: "bold",
+          size: "md",
+          color: "#555555"
+        },
+        {
+          type: "text",
+          text: name,
+          weight: "bold",
+          size: "4xl",
+          wrap: true
+        },
+        { type: "separator", margin: "lg" },
+        {
+          type: "text",
+          text: "不滿意？點「再抽一次」",
+          size: "sm",
+          color: "#888888",
+          margin: "md"
+        }
+      ]
+    },
+    styles: { body: { backgroundColor: "#FFFFFF" } }
   };
 }
 
@@ -117,40 +160,30 @@ async function setMenu(chatKey, menu) {
   }
 }
 
-// ====== Express 應用 ======
+// ====== Express / LINE Webhook ======
 const app = express();
-
-// LINE 需要原始字串計算簽章，因此用 text 讀 body
+// LINE 驗簽需要原始字串
 app.use(express.text({ type: "*/*" }));
 
-// 健康檢查
 app.get("/", (_, res) => res.send("OK"));
 
-// Webhook
 app.post("/webhook", async (req, res) => {
   const signature = req.headers["x-line-signature"];
 
   // 1) 驗簽
   const ok = validateSignature(req.body, config.channelSecret, signature);
-  if (!ok) {
-    return res.status(401).send("Invalid signature");
-  }
+  if (!ok) return res.status(401).send("Invalid signature");
 
-  // 2) LINE 的 Verify 會傳純文字 'test'，不是 JSON → 直接 200
+  // 2) Verify 時 body 可能是 'test'：不是 JSON → 回 200
   if (typeof req.body === "string") {
-    try {
-      JSON.parse(req.body);
-    } catch {
-      return res.status(200).send("OK");
-    }
+    try { JSON.parse(req.body); } catch { return res.status(200).send("OK"); }
   }
 
-  // 3) 事件處理
+  // 3) 解析事件
   let body;
   try {
     body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
   } catch (e) {
-    // 保險：避免重試風暴
     console.error("[Webhook] JSON parse error:", e);
     return res.status(200).send("OK");
   }
@@ -159,25 +192,24 @@ app.post("/webhook", async (req, res) => {
   const events = body.events || [];
 
   await Promise.all(events.map(async (event) => {
-    // 進群打招呼（可選）
     if (event.type === "join" || event.type === "memberJoined") {
       return client.replyMessage(event.replyToken, {
         type: "text",
         text: "大家好～輸入「吃什麼」幫你們決定晚餐 🍱",
       });
     }
-
     if (event.type !== "message" || event.message.type !== "text") return;
+
     const replyToken = event.replyToken;
     const text = (event.message.text || "").trim();
     const chatKey = getChatKey(event.source);
 
-    // /id：顯示目前聊天室 ID
+    // /id：顯示聊天室 ID
     if (text === "/id") {
       return client.replyMessage(replyToken, { type: "text", text: `chatKey: ${chatKey}` });
     }
 
-    // /debug：強制寫入一筆 DEBUG項目 到 Google Sheet
+    // /debug：強制寫入一筆
     if (text === "/debug") {
       try {
         let menu = await getMenu(chatKey);
@@ -190,10 +222,11 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // 一般功能
+    // ====== 功能區 ======
     try {
+      // 吃什麼（回 Flex 卡片 + 快捷鍵）
       if (text === "吃什麼" || text === "/吃什麼") {
-        let menu = await getMenu(chatKey);
+        const menu = await getMenu(chatKey);
         if (!menu.length) {
           return client.replyMessage(replyToken, {
             type: "text",
@@ -203,12 +236,14 @@ app.post("/webhook", async (req, res) => {
         }
         const choice = pickRandom(menu);
         return client.replyMessage(replyToken, [
-          { type: "text", text: `今晚吃：${choice} 🍽️`, quickReply: quickReply() },
+          { type: "flex", altText: `今晚吃：${choice}`, contents: buildDinnerCard(choice) },
+          { type: "text", text: `🎯 抽到：${choice}`, quickReply: quickReply() }
         ]);
       }
 
+      // 清單
       if (text === "清單" || text === "/清單") {
-        let menu = await getMenu(chatKey);
+        const menu = await getMenu(chatKey);
         const list = menu.length ? menu.join("、") : "（目前沒有項目）";
         return client.replyMessage(replyToken, {
           type: "text",
@@ -217,6 +252,7 @@ app.post("/webhook", async (req, res) => {
         });
       }
 
+      // 加
       if (text.startsWith("/加 ")) {
         const item = text.replace("/加", "").trim();
         if (!item) {
@@ -232,6 +268,7 @@ app.post("/webhook", async (req, res) => {
         });
       }
 
+      // 刪
       if (text.startsWith("/刪 ")) {
         const item = text.replace("/刪", "").trim();
         if (!item) {
@@ -247,12 +284,13 @@ app.post("/webhook", async (req, res) => {
         });
       }
 
+      // 說明
       if (text === "說明" || text === "/說明" || text.toLowerCase() === "help") {
         return client.replyMessage(replyToken, {
           type: "text",
           text:
             "用法：\n" +
-            "・輸入「吃什麼」→ 隨機抽一個\n" +
+            "・輸入「吃什麼」→ 顯示卡片並隨機抽一個\n" +
             "・/清單 → 查看清單\n" +
             "・/加 品項名 → 加入清單（例：/加 牛肉麵）\n" +
             "・/刪 品項名 → 從清單移除（例：/刪 拉麵）\n" +
@@ -262,7 +300,7 @@ app.post("/webhook", async (req, res) => {
         });
       }
 
-      // 非指令：提示
+      // 其他訊息：提示
       return client.replyMessage(replyToken, {
         type: "text",
         text: "輸入「吃什麼」來抽晚餐 🎲；或打「/說明」看用法。",
@@ -270,7 +308,6 @@ app.post("/webhook", async (req, res) => {
       });
     } catch (e) {
       console.error("[Handler] error:", e);
-      // 回一個通用錯誤訊息，避免 LINE 重試
       return client.replyMessage(replyToken, {
         type: "text",
         text: "抱歉，我這邊出了一點狀況，等一下再試一次 ><",
